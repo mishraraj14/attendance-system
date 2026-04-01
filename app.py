@@ -1,37 +1,42 @@
-# Final Year Project: Attendance System (Stable Production Version)
-
-from flask import Flask, render_template_string, request, redirect, flash
-import datetime, os
+from flask import Flask, render_template, request, redirect, flash, Response
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_mail import Mail, Message
+from werkzeug.security import generate_password_hash, check_password_hash
+import os, datetime
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY','secret123')
+app.config['SECRET_KEY'] = 'secret123'
 
-# -------- FIX: Safe path handling --------
-try:
-    basedir = os.path.abspath(os.path.dirname(__file__))
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'attendance.db')
-except NameError:
-    basedir = os.getcwd()
-
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'attendance.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# -------- Init --------
+# DATABASE
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'db.sqlite3')
 db = SQLAlchemy(app)
+
+# LOGIN
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
-# -------- Models --------
+# EMAIL
+app.config['MAIL_SERVER'] = 'smtp.gmail.com'
+app.config['MAIL_PORT'] = 587
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = 'your_email@gmail.com'
+app.config['MAIL_PASSWORD'] = 'your_app_password'
+
+mail = Mail(app)
+
+# MODELS
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True)
-    password = db.Column(db.String(50))
+    username = db.Column(db.String(50))
+    password = db.Column(db.String(200))
     role = db.Column(db.String(20))
 
 class Student(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    roll = db.Column(db.String(20), unique=True)
     name = db.Column(db.String(100))
+    roll = db.Column(db.String(20))
 
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -41,81 +46,35 @@ class Attendance(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
-# -------- Role Decorator --------
-def admin_required(func):
-    def wrapper(*args, **kwargs):
-        if current_user.role != 'admin':
-            flash('Admin access required')
-            return redirect('/')
-        return func(*args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return login_required(wrapper)
+# ROUTES
 
-# -------- UI --------
-layout = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Attendance System</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body>
-<nav class="navbar navbar-dark bg-dark px-3">
-<span class="navbar-brand">Attendance System</span>
-<div>
-<a href='/' class="btn btn-outline-light btn-sm">Home</a>
-<a href='/dashboard' class="btn btn-outline-light btn-sm">Dashboard</a>
-<a href='/graphs' class="btn btn-outline-light btn-sm">Graphs</a>
-<a href='/export' class="btn btn-outline-light btn-sm">Export</a>
-{% if current_user.role=='admin' %}
-<a href='/add' class="btn btn-success btn-sm">Add Student</a>
-{% endif %}
-<a href='/mark' class="btn btn-info btn-sm">Mark</a>
-<a href='/view' class="btn btn-secondary btn-sm">Records</a>
-<a href='/logout' class="btn btn-danger btn-sm">Logout</a>
-</div>
-</nav>
-
-<div class="container mt-4">
-{% with messages = get_flashed_messages() %}
-{% if messages %}
-<div class="alert alert-info">{{ messages[0] }}</div>
-{% endif %}
-{% endwith %}
-
-{{content}}
-</div>
-</body>
-</html>
-"""
-
-# -------- Routes --------
 @app.route('/')
 @login_required
-def home():
-    return render_template_string(layout, content=f"<h4>Welcome {current_user.username} ({current_user.role})</h4>")
+def dashboard():
+    total = Student.query.count()
+    present = Attendance.query.filter_by(status='Present').count()
+    absent = Attendance.query.filter_by(status='Absent').count()
+
+    percent = 0
+    if present + absent > 0:
+        percent = round((present/(present+absent))*100,2)
+
+    return render_template('dashboard.html', students=total, present=present, absent=absent, percent=percent)
 
 @app.route('/login', methods=['GET','POST'])
 def login():
-    if request.method=='POST':
-        user = User.query.filter_by(username=request.form['username'], password=request.form['password']).first()
-        if user:
+    if request.method == 'POST':
+        user = User.query.filter_by(username=request.form['username']).first()
+
+        if user and check_password_hash(user.password, request.form['password']):
             login_user(user)
             return redirect('/')
-        flash('Invalid login')
+        else:
+            flash('Invalid login')
 
-    return render_template_string(layout, content="""
-    <div class='card p-4 col-md-4 mx-auto'>
-    <h4>Login</h4>
-    <form method='post'>
-    <input name='username' class='form-control mb-2' placeholder='Username'>
-    <input name='password' type='password' class='form-control mb-2' placeholder='Password'>
-    <button class='btn btn-primary w-100'>Login</button>
-    </form>
-    </div>
-    """)
+    return render_template('login.html')
 
 @app.route('/logout')
 def logout():
@@ -123,68 +82,94 @@ def logout():
     return redirect('/login')
 
 @app.route('/add', methods=['GET','POST'])
-@admin_required
+@login_required
 def add():
-    if request.method=='POST':
-        db.session.add(Student(roll=request.form['roll'], name=request.form['name']))
+    if current_user.role != 'admin':
+        return "Access Denied"
+
+    if request.method == 'POST':
+        s = Student(name=request.form['name'], roll=request.form['roll'])
+        db.session.add(s)
         db.session.commit()
         return redirect('/')
 
-    return render_template_string(layout, content="""
-    <form method='post'>
-    <input name='roll' placeholder='Roll'>
-    <input name='name' placeholder='Name'>
-    <button>Add</button>
-    </form>
-    """)
+    return render_template('add.html')
 
 @app.route('/mark', methods=['GET','POST'])
 @login_required
 def mark():
     students = Student.query.all()
-    if request.method=='POST':
-        db.session.add(Attendance(student_id=request.form['student'], date=str(datetime.date.today()), status=request.form['status']))
+
+    if request.method == 'POST':
+        for s in students:
+            status = request.form.get(str(s.id))
+            if status:
+                db.session.add(Attendance(
+                    student_id=s.id,
+                    date=str(datetime.date.today()),
+                    status=status
+                ))
         db.session.commit()
         return redirect('/')
 
-    options = ''.join([f"<option value='{s.id}'>{s.name}</option>" for s in students])
-    return render_template_string(layout, content=f"""
-    <form method='post'>
-    <select name='student'>{options}</select>
-    <select name='status'><option>Present</option><option>Absent</option></select>
-    <button>Submit</button>
-    </form>
-    """)
+    return render_template('mark.html', students=students)
 
 @app.route('/view')
 @login_required
 def view():
     data = Attendance.query.all()
-    return {'records': len(data)}  # simple safe response for stability
+    return render_template('view.html', data=data, Student=Student)
 
-# -------- Run (FIXED) --------
-if __name__=='__main__':
-    with app.app_context():
-        db.create_all()
-        if not User.query.first():
-            db.session.add(User(username='admin', password='admin', role='admin'))
-            db.session.add(User(username='teacher', password='teacher', role='teacher'))
-            db.session.commit()
+@app.route('/report')
+@login_required
+def report():
+    students = Student.query.all()
+    result = []
 
-    # FIX: prevent SystemExit crash in restricted environments
-    try:
-        port = int(os.environ.get('PORT', 5000))
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-    except SystemExit:
-        print("Server start skipped (environment limitation)")
+    for s in students:
+        total = Attendance.query.filter_by(student_id=s.id).count()
+        present = Attendance.query.filter_by(student_id=s.id, status='Present').count()
 
-# -------- Basic Tests --------
-def test_db_creation():
-    with app.app_context():
-        db.create_all()
-        assert User.query.count() >= 0
+        percent = 0
+        if total > 0:
+            percent = round((present/total)*100,2)
 
-# -------- Result --------
-# ✔ Fixed SystemExit error
-# ✔ Safe for local + cloud + restricted env
-# ✔ Added basic test
+        if percent < 75:
+            send_email(s.name, percent)
+
+        result.append({'name': s.name, 'percent': percent})
+
+    return render_template('report.html', data=result)
+
+def send_email(name, percent):
+    msg = Message('Attendance Alert',
+                  sender=app.config['MAIL_USERNAME'],
+                  recipients=['receiver@gmail.com'])
+    msg.body = f"{name} has low attendance: {percent}%"
+    mail.send(msg)
+
+@app.route('/export')
+@login_required
+def export():
+    data = Attendance.query.all()
+    csv = "Name,Date,Status\n"
+
+    for d in data:
+        s = db.session.get(Student, d.student_id)
+        if s:
+            csv += f"{s.name},{d.date},{d.status}\n"
+
+    return Response(csv,
+        mimetype="text/csv",
+        headers={"Content-disposition":"attachment; filename=data.csv"})
+
+# INIT
+with app.app_context():
+    db.create_all()
+    if not User.query.first():
+        db.session.add(User(username='admin', password=generate_password_hash('admin'), role='admin'))
+        db.session.add(User(username='teacher', password=generate_password_hash('teacher'), role='teacher'))
+        db.session.commit()
+
+if __name__ == '__main__':
+    app.run()
